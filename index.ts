@@ -4,7 +4,7 @@ import { Type } from "typebox";
 import { Readability } from "@mozilla/readability";
 import { parseHTML } from "linkedom";
 import TurndownService from "turndown";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -36,8 +36,6 @@ function getExaApiKey(): string | null {
 }
 
 // ─── Storage ──────────────────────────────────────────────────────────────────
-
-const CACHE_TTL_MS = 60 * 60 * 1000;
 
 interface StoredSearch {
 	id: string;
