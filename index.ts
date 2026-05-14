@@ -46,6 +46,16 @@ interface StoredSearch {
 }
 
 const stored = new Map<string, StoredSearch>();
+const MAX_STORED = 50;
+
+function rememberStored(entry: StoredSearch): void {
+	stored.set(entry.id, entry);
+	while (stored.size > MAX_STORED) {
+		const oldest = stored.keys().next().value;
+		if (oldest === undefined) break;
+		stored.delete(oldest);
+	}
+}
 
 function genId(): string {
 	return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
@@ -333,8 +343,66 @@ function extractTitle(text: string): string | null {
 
 // ─── Extension ────────────────────────────────────────────────────────────────
 
+const webSearchSchema = Type.Object({
+	query: Type.Optional(Type.String({ description: "Single search query." })),
+	queries: Type.Optional(Type.Array(Type.String(), {
+		description: "Multiple queries searched in sequence, each returning its own synthesized answer. Prefer this for research — vary phrasing, scope, and angle across 2-4 queries.",
+	})),
+	numResults: Type.Optional(Type.Number({ description: "Results per query (default: 5, max: 20)" })),
+	recencyFilter: Type.Optional(Type.Union([
+		Type.Literal("day"),
+		Type.Literal("week"),
+		Type.Literal("month"),
+		Type.Literal("year"),
+	], { description: "Filter by recency" })),
+	domainFilter: Type.Optional(Type.Array(Type.String(), {
+		description: "Limit to domains (prefix with - to exclude)",
+	})),
+});
+
+interface WebSearchDetails {
+	error?: string;
+	queries?: string[];
+	queryCount?: number;
+	totalResults?: number;
+	searchId?: string;
+}
+
+const fetchContentSchema = Type.Object({
+	url: Type.Optional(Type.String({ description: "Single URL to fetch" })),
+	urls: Type.Optional(Type.Array(Type.String(), { description: "Multiple URLs (parallel)" })),
+});
+
+interface FetchContentDetails {
+	error?: string;
+	url?: string;
+	title?: string;
+	totalChars?: number;
+	responseId?: string;
+	truncated?: boolean;
+	urlCount?: number;
+	successful?: number;
+}
+
+const getSearchContentSchema = Type.Object({
+	responseId: Type.String({ description: "The responseId from web_search or fetch_content" }),
+	query: Type.Optional(Type.String({ description: "Get content for this query (web_search)" })),
+	queryIndex: Type.Optional(Type.Number({ description: "Get content for query at index" })),
+	url: Type.Optional(Type.String({ description: "Get content for this URL" })),
+	urlIndex: Type.Optional(Type.Number({ description: "Get content for URL at index" })),
+});
+
+interface GetSearchContentDetails {
+	error?: string;
+	query?: string;
+	resultCount?: number;
+	url?: string;
+	title?: string;
+	contentLength?: number;
+}
+
 export default function (pi: ExtensionAPI) {
-	pi.registerTool({
+	pi.registerTool<typeof webSearchSchema, WebSearchDetails>({
 		name: "web_search",
 		label: "Web Search",
 		description:
@@ -342,22 +410,7 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet:
 			"Use for web research questions. Prefer {queries:[...]} with 2-4 varied angles over a single query for broader coverage.",
 
-		parameters: Type.Object({
-			query: Type.Optional(Type.String({ description: "Single search query." })),
-			queries: Type.Optional(Type.Array(Type.String(), {
-				description: "Multiple queries searched in sequence, each returning its own synthesized answer. Prefer this for research — vary phrasing, scope, and angle across 2-4 queries.",
-			})),
-			numResults: Type.Optional(Type.Number({ description: "Results per query (default: 5, max: 20)" })),
-			recencyFilter: Type.Optional(Type.Union([
-				Type.Literal("day"),
-				Type.Literal("week"),
-				Type.Literal("month"),
-				Type.Literal("year"),
-			], { description: "Filter by recency" })),
-			domainFilter: Type.Optional(Type.Array(Type.String(), {
-				description: "Limit to domains (prefix with - to exclude)",
-			})),
-		}),
+		parameters: webSearchSchema,
 
 		async execute(_toolCallId, params, signal) {
 			const rawQueries: unknown[] = Array.isArray(params.queries)
@@ -376,39 +429,43 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const numResults = Math.min(params.numResults ?? 5, 20);
-			const allResults: ExaSearchResult["results"] = [];
-			const answers: string[] = [];
+			const perQuery: NonNullable<StoredSearch["queries"]> = [];
 
 			for (let i = 0; i < queries.length; i++) {
 				if (signal?.aborted) break;
 				try {
 					const result = await searchExa(queries[i], numResults, params.recencyFilter, params.domainFilter, signal);
-					if (result.answer) answers.push(result.answer);
-					allResults.push(...result.results);
+					perQuery.push({
+						query: queries[i],
+						answer: result.answer,
+						results: result.results.map(r => ({ title: r.title, url: r.url })),
+						error: null,
+					});
 				} catch (err) {
 					const msg = err instanceof Error ? err.message : String(err);
 					if (msg.toLowerCase().includes("abort")) break;
-					answers.push(`Error searching "${queries[i]}": ${msg}`);
+					perQuery.push({ query: queries[i], answer: "", results: [], error: msg });
 				}
 			}
 
 			// Store results for retrieval
 			const id = genId();
-			stored.set(id, {
+			const entry: StoredSearch = {
 				id,
 				type: "search",
 				timestamp: Date.now(),
-				queries: queries.map((q, i) => ({
-					query: q,
-					answer: answers[i] || "",
-					results: allResults.slice(...allResults.length <= numResults ? [0, allResults.length] : [i * numResults, (i + 1) * numResults]),
-					error: null,
-				})),
-			});
-			pi.appendEntry("web-search-results", stored.get(id));
+				queries: perQuery,
+			};
+			rememberStored(entry);
+			pi.appendEntry("web-search-results", entry);
 
 			// Build output
-			let output = answers.filter(Boolean).join("\n\n---\n\n");
+			const answerBlocks = perQuery.map(q => {
+				if (q.error) return `Error searching "${q.query}": ${q.error}`;
+				return q.answer;
+			}).filter(Boolean);
+			const allResults = perQuery.flatMap(q => q.results);
+			let output = answerBlocks.join("\n\n---\n\n");
 			if (output) output += "\n\n---\n\n**Sources:**\n";
 			output += allResults.map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}`).join("\n\n");
 			output += `\n\n---\nUse get_search_content({ responseId: "${id}" }) for full details.`;
@@ -449,16 +506,13 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerTool({
+	pi.registerTool<typeof fetchContentSchema, FetchContentDetails>({
 		name: "fetch_content",
 		label: "Fetch Content",
 		description: "Fetch URL(s) and extract readable content as markdown. Returns full content for single URLs (with responseId if truncated).",
 		promptSnippet: "Use to extract readable content from URL(s).",
 
-		parameters: Type.Object({
-			url: Type.Optional(Type.String({ description: "Single URL to fetch" })),
-			urls: Type.Optional(Type.Array(Type.String(), { description: "Multiple URLs (parallel)" })),
-		}),
+		parameters: fetchContentSchema,
 
 		async execute(_toolCallId, params, signal) {
 			const urlList = params.urls ?? (params.url ? [params.url] : []);
@@ -475,13 +529,14 @@ export default function (pi: ExtensionAPI) {
 
 			// Store for retrieval
 			const responseId = genId();
-			stored.set(responseId, {
+			const entry: StoredSearch = {
 				id: responseId,
 				type: "fetch",
 				timestamp: Date.now(),
 				urls: results.map(r => ({ url: r.url, title: r.title, content: r.content, error: r.error })),
-			});
-			pi.appendEntry("web-search-results", stored.get(responseId));
+			};
+			rememberStored(entry);
+			pi.appendEntry("web-search-results", entry);
 
 			// Single URL: return content directly
 			if (urlList.length === 1) {
@@ -545,19 +600,13 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerTool({
+	pi.registerTool<typeof getSearchContentSchema, GetSearchContentDetails>({
 		name: "get_search_content",
 		label: "Get Search Content",
 		description: "Retrieve full content from a previous web_search or fetch_content call.",
 		promptSnippet: "Use after web_search/fetch_content when full stored content is needed via responseId plus query/url selectors.",
 
-		parameters: Type.Object({
-			responseId: Type.String({ description: "The responseId from web_search or fetch_content" }),
-			query: Type.Optional(Type.String({ description: "Get content for this query (web_search)" })),
-			queryIndex: Type.Optional(Type.Number({ description: "Get content for query at index" })),
-			url: Type.Optional(Type.String({ description: "Get content for this URL" })),
-			urlIndex: Type.Optional(Type.Number({ description: "Get content for URL at index" })),
-		}),
+		parameters: getSearchContentSchema,
 
 		async execute(_toolCallId, params) {
 			const data = stored.get(params.responseId);
@@ -569,7 +618,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (data.type === "search" && data.queries) {
-				let qd: StoredSearch["queries"][number] | undefined;
+				let qd: NonNullable<StoredSearch["queries"]>[number] | undefined;
 				if (params.query !== undefined) {
 					qd = data.queries.find(q => q.query === params.query);
 					if (!qd) return { content: [{ type: "text", text: `Query "${params.query}" not found.` }], details: { error: "Not found" } };
@@ -587,7 +636,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (data.type === "fetch" && data.urls) {
-				let ud: StoredSearch["urls"][number] | undefined;
+				let ud: NonNullable<StoredSearch["urls"]>[number] | undefined;
 				if (params.url !== undefined) {
 					ud = data.urls.find(u => u.url === params.url);
 					if (!ud) return { content: [{ type: "text", text: `URL not found.` }], details: { error: "Not found" } };
