@@ -122,11 +122,19 @@ async function searchViaExaApi(
 	query: string,
 	apiKey: string,
 	numResults: number,
+	numResultsSpecified: boolean,
 	recencyFilter?: string,
 	domainFilter?: string[],
 	signal?: AbortSignal,
 ): Promise<ExaSearchResult> {
-	const useSearch = !!recencyFilter || !!domainFilter?.length || numResults !== 5;
+	// numResults !== 5 used to stand in for "caller asked for something
+	// specific", but that's indistinguishable from a caller explicitly asking
+	// for exactly 5 -- both collapse to the same number by the time it gets
+	// here. That silently routed an explicit numResults:5 through the
+	// synthesized single-Answer API instead of the plain multi-result Search
+	// API the caller actually asked for. numResultsSpecified carries the
+	// caller's actual intent instead of trying to infer it from a value.
+	const useSearch = !!recencyFilter || !!domainFilter?.length || numResultsSpecified;
 	const sig = reqSignal(signal);
 
 	if (!useSearch) {
@@ -260,20 +268,33 @@ async function searchViaExaMcp(
 		return s ? `${s}\nSource: ${r.title} (${r.url})` : null;
 	}).filter(Boolean).join("\n\n");
 
+	// This parsing is coupled to Exa's current plaintext MCP response format
+	// ("Title: ...", "URL: ..." lines), which isn't schema-backed and could
+	// change on their end without warning. If that happens, results/answer
+	// both silently come out empty -- indistinguishable from a genuine "no
+	// results found". Since text was non-empty, fall back to surfacing it
+	// raw rather than returning nothing.
+	if (results.length === 0 && text.trim()) {
+		return { answer: text.trim().slice(0, 3000), results: [] };
+	}
+
 	return { answer, results };
 }
 
 async function searchExa(
 	query: string,
 	numResults: number,
+	numResultsSpecified: boolean,
 	recencyFilter?: string,
 	domainFilter?: string[],
 	signal?: AbortSignal,
 ): Promise<ExaSearchResult> {
 	const apiKey = getExaApiKey();
 	if (apiKey) {
-		return searchViaExaApi(query, apiKey, numResults, recencyFilter, domainFilter, signal);
+		return searchViaExaApi(query, apiKey, numResults, numResultsSpecified, recencyFilter, domainFilter, signal);
 	}
+	// MCP has no Answer-vs-Search split to route between, so it has no use
+	// for numResultsSpecified.
 	return searchViaExaMcp(query, numResults, recencyFilter, domainFilter, signal);
 }
 
@@ -454,13 +475,14 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
+			const numResultsSpecified = params.numResults !== undefined;
 			const numResults = Math.min(params.numResults ?? 5, 20);
 			const perQuery: NonNullable<StoredSearch["queries"]> = [];
 
 			for (let i = 0; i < queries.length; i++) {
 				if (signal?.aborted) break;
 				try {
-					const result = await searchExa(queries[i], numResults, params.recencyFilter, params.domainFilter, signal);
+					const result = await searchExa(queries[i], numResults, numResultsSpecified, params.recencyFilter, params.domainFilter, signal);
 					perQuery.push({
 						query: queries[i],
 						answer: result.answer,
