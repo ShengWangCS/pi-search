@@ -1,4 +1,4 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { Readability } from "@mozilla/readability";
@@ -59,6 +59,32 @@ function rememberStored(entry: StoredSearch): void {
 
 function genId(): string {
 	return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
+
+// `stored` only lives as long as this pi process does. But responseIds handed
+// back to the model in tool output ("Use get_search_content({responseId...})")
+// get written into the session's on-disk JSONL, which outlives the process --
+// pi is a single long-lived subprocess that switches between many on-disk
+// sessions over its lifetime, and can itself restart. Without this fallback,
+// resuming an older session (or just outliving a restart) turns every prior
+// responseId into a dead reference, even though appendEntry genuinely did
+// persist the data. appendEntry's doc comment describes exactly this pattern:
+// "On reload, extensions can scan entries for their customType and
+// reconstruct internal state." Falls back to that scan on a cache miss,
+// rather than eagerly replaying all entries on load (a session can accumulate
+// a lot of these, and most are never looked up again).
+function findStored(responseId: string, ctx: ExtensionContext): StoredSearch | undefined {
+	const hit = stored.get(responseId);
+	if (hit) return hit;
+	for (const entry of ctx.sessionManager.getEntries()) {
+		if (entry.type !== "custom" || entry.customType !== "web-search-results") continue;
+		const data = entry.data as StoredSearch | undefined;
+		if (data?.id === responseId) {
+			stored.set(responseId, data); // write-through so repeat lookups skip the scan
+			return data;
+		}
+	}
+	return undefined;
 }
 
 // ─── Exa search ───────────────────────────────────────────────────────────────
@@ -608,8 +634,8 @@ export default function (pi: ExtensionAPI) {
 
 		parameters: getSearchContentSchema,
 
-		async execute(_toolCallId, params) {
-			const data = stored.get(params.responseId);
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const data = findStored(params.responseId, ctx);
 			if (!data) {
 				return {
 					content: [{ type: "text", text: `No stored results for "${params.responseId}"` }],
