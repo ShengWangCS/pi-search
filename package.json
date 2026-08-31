@@ -1,5 +1,5 @@
 {
-  "name": "pi-exa",
+  "name": "pi-search",
   "version": "0.1.0",
   "description": "Minimal Exa search + URL fetch for Pi coding agent",
   "type": "module",

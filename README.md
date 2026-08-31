@@ -1,4 +1,4 @@
-# pi-exa
+# pi-search
 
 Minimal Exa search + URL fetch extension for the [Pi coding agent](https://pi.dev).
 
@@ -12,7 +12,7 @@ No YouTube, GitHub, video, PDF, Perplexity, Gemini, curator UI, activity monitor
 ## Install
 
 ```bash
-pi install git:github.com/<user>/pi-exa
+pi install git:github.com/<user>/pi-search
 ```
 
 ## Config
