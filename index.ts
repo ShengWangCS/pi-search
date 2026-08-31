@@ -61,18 +61,10 @@ function genId(): string {
 	return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 }
 
-// `stored` only lives as long as this pi process does. But responseIds handed
-// back to the model in tool output ("Use get_search_content({responseId...})")
-// get written into the session's on-disk JSONL, which outlives the process --
-// pi is a single long-lived subprocess that switches between many on-disk
-// sessions over its lifetime, and can itself restart. Without this fallback,
-// resuming an older session (or just outliving a restart) turns every prior
-// responseId into a dead reference, even though appendEntry genuinely did
-// persist the data. appendEntry's doc comment describes exactly this pattern:
-// "On reload, extensions can scan entries for their customType and
-// reconstruct internal state." Falls back to that scan on a cache miss,
-// rather than eagerly replaying all entries on load (a session can accumulate
-// a lot of these, and most are never looked up again).
+// responseIds live on in session JSONLs, but `stored` dies with the pi
+// process — so on a cache miss, lazily re-scan persisted entries
+// (appendEntry's documented reconstruct-on-reload pattern) instead of
+// eagerly replaying them on load.
 function findStored(responseId: string, ctx: ExtensionContext): StoredSearch | undefined {
 	const hit = stored.get(responseId);
 	if (hit) return hit;
@@ -127,13 +119,8 @@ async function searchViaExaApi(
 	domainFilter?: string[],
 	signal?: AbortSignal,
 ): Promise<ExaSearchResult> {
-	// numResults !== 5 used to stand in for "caller asked for something
-	// specific", but that's indistinguishable from a caller explicitly asking
-	// for exactly 5 -- both collapse to the same number by the time it gets
-	// here. That silently routed an explicit numResults:5 through the
-	// synthesized single-Answer API instead of the plain multi-result Search
-	// API the caller actually asked for. numResultsSpecified carries the
-	// caller's actual intent instead of trying to infer it from a value.
+	// numResults !== 5 can't distinguish "explicitly asked for 5" from
+	// "didn't ask" — numResultsSpecified carries the actual intent.
 	const useSearch = !!recencyFilter || !!domainFilter?.length || numResultsSpecified;
 	const sig = reqSignal(signal);
 
@@ -268,12 +255,8 @@ async function searchViaExaMcp(
 		return s ? `${s}\nSource: ${r.title} (${r.url})` : null;
 	}).filter(Boolean).join("\n\n");
 
-	// This parsing is coupled to Exa's current plaintext MCP response format
-	// ("Title: ...", "URL: ..." lines), which isn't schema-backed and could
-	// change on their end without warning. If that happens, results/answer
-	// both silently come out empty -- indistinguishable from a genuine "no
-	// results found". Since text was non-empty, fall back to surfacing it
-	// raw rather than returning nothing.
+	// Coupled to Exa's unschema'd plaintext MCP format; if it changes, this
+	// yields empty results, so surface the raw text instead of nothing.
 	if (results.length === 0 && text.trim()) {
 		return { answer: text.trim().slice(0, 3000), results: [] };
 	}
@@ -293,8 +276,7 @@ async function searchExa(
 	if (apiKey) {
 		return searchViaExaApi(query, apiKey, numResults, numResultsSpecified, recencyFilter, domainFilter, signal);
 	}
-	// MCP has no Answer-vs-Search split to route between, so it has no use
-	// for numResultsSpecified.
+	// MCP has no Answer-vs-Search split; numResultsSpecified doesn't apply.
 	return searchViaExaMcp(query, numResults, recencyFilter, domainFilter, signal);
 }
 
@@ -302,10 +284,7 @@ async function searchExa(
 
 const HTTP_TIMEOUT_MS = 30000;
 const MIN_USEFUL_CONTENT = 500;
-// Guard linkedom's in-RAM DOM parse against multi-MB pages — a phone-sized
-// hazard: several MB of HTML can turn a fast fetch into a multi-second GC
-// stall. 3MB comfortably covers article pages; larger is almost certainly
-// app-shell bloat or a non-document payload.
+// Multi-MB HTML turns linkedom's in-RAM parse into a GC stall on a phone.
 const MAX_HTML_BYTES = 3_000_000;
 
 const turndown = new TurndownService({ headingStyle: "atx", codeBlockStyle: "fenced" });
@@ -402,10 +381,8 @@ function extractTitle(text: string): string | null {
 
 // ─── Per-session fetch cache ─────────────────────────────────────────────────
 
-// Re-fetching the same URL within a session pays full HTTP + Readability +
-// turndown cost each time. Dedupe against the stored entries (same LRU that
-// backs get_search_content): a same-session repeat returns the cached copy
-// marked (cached), so the model knows it may be stale.
+// Same-session repeats return the stored copy (marked cached, so the model
+// knows it may be stale) instead of re-paying fetch + extract.
 function findCachedFetch(url: string): { url: string; title: string; content: string; error: string | null } | null {
 	for (const entry of stored.values()) {
 		if (entry.type !== "fetch") continue;
