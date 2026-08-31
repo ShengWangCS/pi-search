@@ -302,6 +302,11 @@ async function searchExa(
 
 const HTTP_TIMEOUT_MS = 30000;
 const MIN_USEFUL_CONTENT = 500;
+// Guard linkedom's in-RAM DOM parse against multi-MB pages — a phone-sized
+// hazard: several MB of HTML can turn a fast fetch into a multi-second GC
+// stall. 3MB comfortably covers article pages; larger is almost certainly
+// app-shell bloat or a non-document payload.
+const MAX_HTML_BYTES = 3_000_000;
 
 const turndown = new TurndownService({ headingStyle: "atx", codeBlockStyle: "fenced" });
 
@@ -352,6 +357,10 @@ async function fetchUrl(url: string, signal?: AbortSignal): Promise<FetchResult>
 		const text = await res.text();
 		const isHTML = contentType.includes("text/html") || contentType.includes("application/xhtml+xml");
 
+		if (isHTML && text.length > MAX_HTML_BYTES) {
+			return { url, title: "", content: "", error: `HTML too large to parse (${(text.length / 1e6).toFixed(1)}MB > 3MB cap)` };
+		}
+
 		if (!isHTML) {
 			const title = extractTitle(text) || new URL(url).pathname.split("/").pop() || url;
 			return { url, title, content: text, error: null };
@@ -361,14 +370,15 @@ async function fetchUrl(url: string, signal?: AbortSignal): Promise<FetchResult>
 		const reader = new Readability(document as unknown as Document);
 		const article = reader.parse();
 
-		if (!article || (turndown.turndown(article.content).length < MIN_USEFUL_CONTENT)) {
-			return { url, title: article?.title || "", content: article ? turndown.turndown(article.content) : "", error: "Could not extract readable content" };
+		const markdown = article ? turndown.turndown(article.content) : "";
+		if (!article || markdown.length < MIN_USEFUL_CONTENT) {
+			return { url, title: article?.title || "", content: markdown, error: "Could not extract readable content" };
 		}
 
 		return {
 			url,
 			title: article.title || "",
-			content: turndown.turndown(article.content),
+			content: markdown,
 			error: null,
 		};
 	} catch (err) {
@@ -389,6 +399,21 @@ function extractTitle(text: string): string | null {
 }
 
 // ─── Extension ────────────────────────────────────────────────────────────────
+
+// ─── Per-session fetch cache ─────────────────────────────────────────────────
+
+// Re-fetching the same URL within a session pays full HTTP + Readability +
+// turndown cost each time. Dedupe against the stored entries (same LRU that
+// backs get_search_content): a same-session repeat returns the cached copy
+// marked (cached), so the model knows it may be stale.
+function findCachedFetch(url: string): { url: string; title: string; content: string; error: string | null } | null {
+	for (const entry of stored.values()) {
+		if (entry.type !== "fetch") continue;
+		const hit = entry.urls?.find((u) => u.url === url);
+		if (hit && !hit.error) return hit;
+	}
+	return null;
+}
 
 const webSearchSchema = Type.Object({
 	query: Type.Optional(Type.String({ description: "Single search query." })),
@@ -571,9 +596,12 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			const results = await Promise.all(urlList.map(url => fetchUrl(url, signal)));
-			const successful = results.filter(r => !r.error);
-			const failed = results.filter(r => r.error);
+			// Same-session repeat: serve from the stored LRU instead of re-fetching.
+			const results = urlList.map((url) => findCachedFetch(url) ?? fetchUrl(url, signal));
+			const settled = await Promise.all(results);
+			const cached = results.some((r) => !(r instanceof Promise));
+			const successful = settled.filter((r) => !r.error);
+			const failed = settled.filter((r) => r.error);
 
 			// Store for retrieval
 			const responseId = genId();
@@ -588,7 +616,7 @@ export default function (pi: ExtensionAPI) {
 
 			// Single URL: return content directly
 			if (urlList.length === 1) {
-				const r = results[0];
+				const r = settled[0];
 				if (r.error) {
 					return {
 						content: [{ type: "text", text: `Error: ${r.error}` }],
@@ -601,6 +629,7 @@ export default function (pi: ExtensionAPI) {
 				if (truncated) {
 					output += `\n\n---\nUse get_search_content({ responseId: "${responseId}", urlIndex: 0 }) for full content.`;
 				}
+				if (cached) output += "\n\n(cached from earlier in this session)";
 				return {
 					content: [{ type: "text", text: output }],
 					details: { url: r.url, title: r.title, totalChars: r.content.length, responseId, truncated },
