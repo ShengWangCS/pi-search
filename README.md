@@ -1,6 +1,6 @@
 # pi-search
 
-Minimal Exa search + URL fetch for the [Pi coding agent](https://pi.dev). Stripped-down fork of [pi-web-access](https://github.com/nicobailon/pi-web-access) (~5,000 lines removed).
+Minimal Exa search + URL fetch for the [Pi coding agent](https://pi.dev). A stripped-down fork of [pi-web-access](https://github.com/nicobailon/pi-web-access) by [Nico Bailon](https://github.com/nicobailon) (~5,000 lines removed), carrying forward the original's MIT license — see [LICENSE](./LICENSE).
 
 - `web_search` — Exa direct API or MCP
 - `fetch_content` — HTTP + Readability → markdown (3MB parse cap, same-session dedupe)
@@ -9,7 +9,7 @@ Minimal Exa search + URL fetch for the [Pi coding agent](https://pi.dev). Stripp
 ## Install
 
 ```bash
-pi install git:github.com/<user>/pi-search
+pi install git:github.com/ShengWangCS/pi-search
 ```
 
 ## Config
